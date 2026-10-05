@@ -31,6 +31,13 @@ Status: personal/portfolio project for now. Possibly sold to multiple Tunisian p
 
 Verify each site's actual structure (RSS feed available? HTML layout?) before writing its scraper. Respect robots.txt and add polite delays.
 
+Source status (checked 2026-10-05 from Tunisia):
+- ONMNE: WordPress; RSS broken, read via REST API (`/?rest_route=/wp/v2/posts`). Site has injected spam posts (category 427), which are skipped. Posts rarely (last health post Sept 2025).
+- Ministry of Health: santetunisie.rns.tn doesn't resolve; sante.gov.tn shows a default XAMPP page. No usable site; it communicates mainly via Facebook (deferred).
+- INSP (insp.rns.tn): "site en cours de construction". Nothing to read.
+- TAP: certificate chain misconfigured + intermittent "no route to host". Skipped; La Presse/Babnet republish TAP dispatches.
+- WHO EMRO Tunisia: RSS feed exists but is empty. WHO DON API covers outbreaks.
+
 ## Pipeline
 1. **Collect:** scrapers/RSS readers pull new articles every 30–60 min; fingerprint to deduplicate the same story across outlets.
 2. **Understand:** AI model reads Arabic/French articles → is it health-relevant? Extract disease, governorate, case counts, severity, trend.

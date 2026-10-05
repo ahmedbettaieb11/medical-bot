@@ -6,6 +6,9 @@ Run it directly to preview what it finds (nothing is saved or sent):  python sou
 import html
 import re
 import time
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin
 
 import feedparser
 import requests
@@ -13,6 +16,7 @@ import requests
 # Identify ourselves honestly to the websites we read.
 HEADERS = {"User-Agent": "MedicalAlertBotTN/0.1 (personal health-monitoring project)"}
 DELAY_SECONDS = 2  # polite pause between two websites
+MAX_AGE_DAYS = 14  # older articles are ignored, so a newly added source doesn't send old news
 
 # RSS feeds checked on 2026-10-05: all respond and their robots.txt allows reading them.
 FEEDS = [
@@ -25,6 +29,11 @@ FEEDS = [
 ]
 
 WHO_DON_API = "https://www.who.int/api/news/diseaseoutbreaknews"
+
+# ONMNE's site is WordPress. Its RSS feed is broken, but WordPress's data API works.
+# Category 427 holds spam posts injected into the site (e.g. "The Founding of YouTube"), so we skip it.
+ONMNE_SITE = "https://www.onmne.tn"
+ONMNE_SPAM_CATEGORIES = {427}
 
 # Phase 1 uses simple keywords to decide if an article is about health.
 # (Phase 2 replaces this with an AI model that actually reads the article.)
@@ -52,7 +61,7 @@ ARABIC_KEYWORDS = [
 ]
 
 _french_pattern = re.compile(
-    r"\b(" + "|".join(re.escape(k) for k in FRENCH_KEYWORDS) + r")\b", re.IGNORECASE
+    r"\b(" + "|".join(re.escape(k) for k in FRENCH_KEYWORDS) + r")(?:s|x)?\b", re.IGNORECASE
 )
 _ARABIC_LETTER = r"[\u0621-\u064A]"
 _arabic_pattern = re.compile(
@@ -72,6 +81,20 @@ def health_keywords_found(text):
     found = {m.group(1).lower() for m in _french_pattern.finditer(text)}
     found.update(m.group(1) for m in _arabic_pattern.finditer(normalize_arabic(text)))
     return sorted(found)
+
+
+def is_recent(published):
+    """True if the date is within MAX_AGE_DAYS (or if we can't read the date, to be safe)."""
+    try:
+        date = parsedate_to_datetime(published)  # RSS style: "Mon, 05 Oct 2026 15:31:41 +0100"
+    except (TypeError, ValueError):
+        try:
+            date = datetime.fromisoformat(published.replace("Z", "+00:00"))  # "2026-10-05T15:31:41"
+        except (AttributeError, ValueError):
+            return True
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - date <= timedelta(days=MAX_AGE_DAYS)
 
 
 def clean_html(raw):
@@ -127,6 +150,32 @@ def read_who_outbreak_news():
     return articles
 
 
+def read_onmne():
+    """Latest posts from ONMNE (Observatoire National des Maladies Nouvelles et Émergentes)."""
+    params = {
+        "rest_route": "/wp/v2/posts",
+        "per_page": "20",
+        "_fields": "date,link,title,excerpt,categories",
+    }
+    response = requests.get(ONMNE_SITE + "/", params=params, headers=HEADERS, timeout=30)
+    response.raise_for_status()
+    articles = []
+    for post in response.json():
+        if ONMNE_SPAM_CATEGORIES & set(post.get("categories", [])):
+            continue
+        articles.append({
+            "url": urljoin(ONMNE_SITE, post["link"]),
+            "title": clean_html(post["title"]["rendered"]),
+            "summary": clean_html(post.get("excerpt", {}).get("rendered")),
+            "source": "ONMNE",
+            "language": "fr",
+            "published": post.get("date", ""),
+            # Every ONMNE post names ONMNE and the Ministry, even job ads, so they prove nothing here.
+            "ignore_keywords": {"onmne", "ministère de la santé"},
+        })
+    return articles
+
+
 def collect_health_articles():
     """Read every source and return only the health-related articles.
 
@@ -134,6 +183,7 @@ def collect_health_articles():
     """
     health_articles = []
     readers = [(f"{f['source']} ({f['language']})", lambda f=f: read_feed(f)) for f in FEEDS]
+    readers.append(("ONMNE", read_onmne))
     readers.append(("WHO Disease Outbreak News", read_who_outbreak_news))
 
     for name, reader in readers:
@@ -143,18 +193,25 @@ def collect_health_articles():
             print(f"⚠️  {name}: could not read ({error})")
             continue
 
-        kept = 0
+        kept = old = 0
         for article in articles:
+            ignore = article.pop("ignore_keywords", set())
+            if not is_recent(article["published"]):
+                article.pop("mentions_tunisia", None)
+                old += 1
+                continue
             # WHO outbreak news is always about health; we only keep the ones about Tunisia.
             if "mentions_tunisia" in article:
                 keywords = ["WHO: Tunisia"] if article.pop("mentions_tunisia") else []
             else:
                 keywords = health_keywords_found(article["title"] + " " + article["summary"])
+                keywords = [k for k in keywords if k not in ignore]
             if keywords:
                 article["keywords"] = keywords
                 health_articles.append(article)
                 kept += 1
-        print(f"✅ {name}: {len(articles)} articles read, {kept} about health")
+        too_old = f" ({old} older than {MAX_AGE_DAYS} days skipped)" if old else ""
+        print(f"✅ {name}: {len(articles)} articles read, {kept} about health{too_old}")
         time.sleep(DELAY_SECONDS)
 
     return health_articles
