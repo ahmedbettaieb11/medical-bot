@@ -1,0 +1,42 @@
+# Runs the bot automatically on GitHub's computers, every hour.
+name: Medical alert bot
+
+on:
+  schedule:
+    - cron: "7 * * * *"   # minute 7 of every hour (UTC); GitHub may start it a few minutes late
+  workflow_dispatch:       # adds a "Run workflow" button to start it by hand
+
+permissions:
+  contents: write          # lets the bot save the updated database back into the repository
+
+concurrency:
+  group: medical-bot       # never run two copies at the same time
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run the bot
+        run: python main.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Save the database (remembers which articles were already sent)
+        if: always()
+        run: |
+          git config user.name "medical-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add medical_bot.db
+          git diff --cached --quiet || (git commit -m "Update article database" && git push)

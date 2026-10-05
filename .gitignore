@@ -1,0 +1,4 @@
+# Files that must never be uploaded online
+.env
+.venv/
+__pycache__/
