@@ -1,6 +1,7 @@
 """Sends messages to your Telegram chat, using the token and chat ID saved in .env."""
 
 import html
+import json
 import os
 import time
 
@@ -36,24 +37,32 @@ def send_message(text):
     return False
 
 
+SEVERITY_LABELS = {"high": "🔴 HIGH", "medium": "🟠 MEDIUM", "low": "🟡 LOW"}
+TREND_LABELS = {"rising": "📈 rising", "stable": "➡️ stable", "falling": "📉 falling"}
+
+
 def format_article(article):
-    """Build the alert text for one article from the database."""
+    """Build the alert text for one article from the database (after the AI has read it)."""
     e = html.escape  # makes titles with < > & safe for Telegram's HTML mode
-    summary = article["summary"] or ""
-    if len(summary) > 250:
-        summary = summary[:250].rsplit(" ", 1)[0] + "…"
+    where = ", ".join(json.loads(article["governorates"] or "[]")) or article["country"] or "?"
     lines = [
-        "🩺 <b>New health article</b>",
-        "",
-        f"<b>{e(article['title'])}</b>",
-        "",
-        f"📰 {e(article['source'])} ({e(article['language'] or '?')})",
+        f"🩺 <b>{e((article['disease'] or 'Health event').capitalize())}</b> — {e(where)}",
+        f"Severity: {SEVERITY_LABELS.get(article['severity'], article['severity'])}",
     ]
-    if article["published"]:
-        lines.append(f"🕒 {e(article['published'])}")
-    if article["keywords"]:
-        lines.append(f"🔎 Matched: {e(article['keywords'])}")
-    if summary:
-        lines += ["", e(summary)]
-    lines += ["", f'<a href="{e(article["url"])}">Read the article</a>']
+    numbers = []
+    if article["cases"] is not None:
+        numbers.append(f"{article['cases']} cases")
+    if article["deaths"] is not None:
+        numbers.append(f"{article['deaths']} deaths")
+    if article["trend"] in TREND_LABELS:
+        numbers.append(TREND_LABELS[article["trend"]])
+    if numbers:
+        lines.append(" · ".join(numbers))
+    lines += [
+        "",
+        e(article["summary_fr"] or ""),
+        "",
+        f"📰 {e(article['source'])}: <i>{e(article['title'])}</i>",
+        f'<a href="{e(article["url"])}">Read the article</a>',
+    ]
     return "\n".join(lines)

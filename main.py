@@ -1,4 +1,4 @@
-"""The bot's main run: collect → save new health articles → alert on Telegram.
+"""The bot's main run: collect → save new health articles → AI reads them → alert on Telegram.
 
 Run it with:  python main.py
 Each run only alerts about articles it hasn't seen before.
@@ -6,11 +6,14 @@ Each run only alerts about articles it hasn't seen before.
 
 import time
 
+import analyze
 import database
 import sources
 import telegram_alert
 
-MAX_ALERTS_PER_RUN = 15  # leftovers are sent on the next run, so Telegram is never flooded
+MAX_ANALYSES_PER_RUN = 30  # keeps us well inside Gemini's free tier; leftovers wait for the next run
+MAX_ALERTS_PER_RUN = 15    # leftovers are sent on the next run, so Telegram is never flooded
+ALERT_SEVERITIES = ("medium", "high")  # "low" (minor or far-away events) only goes to the dashboard
 
 
 def main():
@@ -26,7 +29,24 @@ def main():
             new_count += 1
     print(f"\n💾 {len(articles)} health articles found, {new_count} new (the rest were already saved)")
 
-    pending = database.get_unalerted()
+    print("\n🤖 AI reading new articles...")
+    to_analyze = database.get_unanalyzed()
+    analyzed = 0
+    for article in to_analyze[:MAX_ANALYSES_PER_RUN]:
+        result = analyze.analyze_article(article)
+        if result is None:
+            print("⏸️  Stopping AI analysis for this run; the rest will be analysed next run.")
+            break
+        database.save_analysis(article["id"], result)
+        analyzed += 1
+        verdict = f"✅ {result['severity']}" if result["relevant"] else "⛔ not relevant"
+        print(f"   {verdict}: {article['title'][:80]}")
+        time.sleep(2)  # stay well under the free tier's per-minute limit
+    print(f"🤖 {analyzed} articles analysed")
+    if len(to_analyze) > analyzed:
+        print(f"   ({len(to_analyze) - analyzed} more waiting for the next run)")
+
+    pending = database.get_unalerted(ALERT_SEVERITIES)
     sent = 0
     for article in pending[:MAX_ALERTS_PER_RUN]:
         if not telegram_alert.send_message(telegram_alert.format_article(article)):

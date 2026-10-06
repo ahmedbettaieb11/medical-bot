@@ -4,12 +4,32 @@ Run it directly to create the database and check it works:  python database.py
 """
 
 import hashlib
+import json
 import re
 import sqlite3
 import unicodedata
 from datetime import datetime, timezone
 
 DB_FILE = "medical_bot.db"
+
+
+# Columns added after the first version. The AI analysis columns (Phase 2) stay empty
+# until Gemini has read the article.
+NEW_COLUMNS = [
+    ("keywords", "TEXT"),       # health keywords that matched, e.g. "grippe, vaccin"
+    ("analyzed_at", "TEXT"),    # when Gemini read it (empty = not analysed yet)
+    ("relevant", "INTEGER"),    # 1 = real health event, 0 = noise (job ad, conference...)
+    ("ai_reason", "TEXT"),      # Gemini's one-sentence explanation
+    ("disease", "TEXT"),
+    ("governorates", "TEXT"),   # JSON list, e.g. ["Sfax", "Gabès"]
+    ("country", "TEXT"),
+    ("cases", "INTEGER"),
+    ("deaths", "INTEGER"),
+    ("severity", "TEXT"),       # none / low / medium / high
+    ("trend", "TEXT"),          # rising / stable / falling / unknown
+    ("summary_fr", "TEXT"),
+    ("ai_model", "TEXT"),
+]
 
 
 def connect():
@@ -32,14 +52,14 @@ def init_db():
                 language    TEXT,
                 published   TEXT,
                 fetched_at  TEXT NOT NULL,
-                alerted     INTEGER NOT NULL DEFAULT 0,  -- 1 once sent to Telegram
-                keywords    TEXT  -- health keywords that matched, e.g. "grippe, vaccin"
+                alerted     INTEGER NOT NULL DEFAULT 0  -- 1 once sent to Telegram
             )
         """)
-        # Databases created before the keywords column existed: add it.
+        # Databases created before these columns existed: add the missing ones.
         columns = [row["name"] for row in conn.execute("PRAGMA table_info(articles)")]
-        if "keywords" not in columns:
-            conn.execute("ALTER TABLE articles ADD COLUMN keywords TEXT")
+        for name, kind in NEW_COLUMNS:
+            if name not in columns:
+                conn.execute(f"ALTER TABLE articles ADD COLUMN {name} {kind}")
 
 
 def fingerprint(title):
@@ -69,10 +89,38 @@ def save_article(url, title, summary, source, language, published, keywords=""):
         return cursor.rowcount == 1
 
 
-def get_unalerted():
-    """Articles saved but not yet sent to Telegram, oldest first."""
+def get_unanalyzed():
+    """Articles Gemini hasn't read yet, oldest first."""
     with connect() as conn:
-        return conn.execute("SELECT * FROM articles WHERE alerted = 0 ORDER BY id").fetchall()
+        return conn.execute("SELECT * FROM articles WHERE analyzed_at IS NULL ORDER BY id").fetchall()
+
+
+def save_analysis(article_id, result):
+    """Store Gemini's answer (the dict returned by analyze.analyze_article) for one article."""
+    with connect() as conn:
+        conn.execute(
+            """UPDATE articles SET analyzed_at = ?, relevant = ?, ai_reason = ?, disease = ?,
+                   governorates = ?, country = ?, cases = ?, deaths = ?, severity = ?, trend = ?,
+                   summary_fr = ?, ai_model = ?
+               WHERE id = ?""",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), int(result["relevant"]),
+             result["reason"], result["disease"],
+             json.dumps(result["governorates"], ensure_ascii=False), result["country"],
+             result["cases"], result["deaths"], result["severity"], result["trend"],
+             result["summary_fr"], result["model"], article_id),
+        )
+
+
+def get_unalerted(severities):
+    """Relevant articles with one of these severities, not yet sent to Telegram, oldest first."""
+    marks = ", ".join("?" * len(severities))
+    with connect() as conn:
+        return conn.execute(
+            f"""SELECT * FROM articles
+                WHERE alerted = 0 AND relevant = 1 AND severity IN ({marks})
+                ORDER BY id""",
+            list(severities),
+        ).fetchall()
 
 
 def mark_alerted(article_id):
