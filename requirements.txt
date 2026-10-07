@@ -4,3 +4,5 @@
 requests        # downloads web pages and talks to Telegram
 feedparser      # reads RSS feeds (news sites' "latest articles" lists)
 python-dotenv   # reads secret settings (like the Telegram key) from the .env file
+streamlit       # builds the web dashboard (dashboard.py)
+pandas          # tables for the dashboard
