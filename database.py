@@ -29,7 +29,11 @@ NEW_COLUMNS = [
     ("trend", "TEXT"),          # rising / stable / falling / unknown
     ("summary_fr", "TEXT"),
     ("ai_model", "TEXT"),
+    ("event_id", "INTEGER"),    # the outbreak this article is about (several articles → one event)
 ]
+
+SEVERITY_RANK = {"none": 0, "low": 1, "medium": 2, "high": 3}
+EVENT_WINDOW_DAYS = 30  # a new article can join an event seen in the last 30 days
 
 
 def connect():
@@ -55,11 +59,35 @@ def init_db():
                 alerted     INTEGER NOT NULL DEFAULT 0  -- 1 once sent to Telegram
             )
         """)
+        # One row per real-world event (e.g. "measles in Sfax"), however many outlets report it.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                disease          TEXT,
+                country          TEXT,
+                governorates     TEXT,     -- JSON list, all places mentioned so far
+                cases            INTEGER,  -- highest number reported so far
+                deaths           INTEGER,
+                severity         TEXT,     -- highest severity so far
+                trend            TEXT,     -- from the latest article
+                summary_fr       TEXT,     -- from the latest article
+                first_seen       TEXT NOT NULL,
+                last_seen        TEXT NOT NULL,
+                article_count    INTEGER NOT NULL DEFAULT 1,
+                alerted_severity TEXT      -- severity of the last Telegram alert (empty = never sent)
+            )
+        """)
         # Databases created before these columns existed: add the missing ones.
         columns = [row["name"] for row in conn.execute("PRAGMA table_info(articles)")]
         for name, kind in NEW_COLUMNS:
             if name not in columns:
                 conn.execute(f"ALTER TABLE articles ADD COLUMN {name} {kind}")
+        # Relevant articles analysed before events existed: give each its own event.
+        for article in conn.execute(
+                "SELECT * FROM articles WHERE relevant = 1 AND event_id IS NULL ORDER BY id").fetchall():
+            event_id = _new_event(conn, article, article["analyzed_at"])
+            if article["alerted"]:
+                conn.execute("UPDATE events SET alerted_severity = severity WHERE id = ?", (event_id,))
 
 
 def fingerprint(title):
@@ -111,21 +139,85 @@ def save_analysis(article_id, result):
         )
 
 
-def get_unalerted(severities):
-    """Relevant articles with one of these severities, not yet sent to Telegram, oldest first."""
-    marks = ", ".join("?" * len(severities))
+def _now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_event(conn, article, when):
+    cursor = conn.execute(
+        """INSERT INTO events (disease, country, governorates, cases, deaths, severity, trend,
+                               summary_fr, first_seen, last_seen)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (article["disease"], article["country"], article["governorates"], article["cases"],
+         article["deaths"], article["severity"], article["trend"], article["summary_fr"], when, when),
+    )
+    conn.execute("UPDATE articles SET event_id = ? WHERE id = ?", (cursor.lastrowid, article["id"]))
+    return cursor.lastrowid
+
+
+def _bigger(a, b):
+    """The larger of two numbers, ignoring missing ones."""
+    numbers = [n for n in (a, b) if n is not None]
+    return max(numbers) if numbers else None
+
+
+def get_recent_events():
+    """Events seen in the last EVENT_WINDOW_DAYS days, newest first (shown to Gemini for matching)."""
     with connect() as conn:
         return conn.execute(
-            f"""SELECT * FROM articles
-                WHERE alerted = 0 AND relevant = 1 AND severity IN ({marks})
-                ORDER BY id""",
-            list(severities),
+            "SELECT * FROM events WHERE last_seen >= datetime('now', ?) ORDER BY last_seen DESC",
+            (f"-{EVENT_WINDOW_DAYS} days",),
         ).fetchall()
 
 
-def mark_alerted(article_id):
+def link_to_event(article_id, event_id=None):
+    """Attach an analysed, relevant article to an event: an existing one (event_id), or a new one.
+
+    When joining an existing event, the event keeps the highest numbers and severity reported
+    so far, all places mentioned, and the latest trend and summary.
+    """
     with connect() as conn:
-        conn.execute("UPDATE articles SET alerted = 1 WHERE id = ?", (article_id,))
+        article = conn.execute("SELECT * FROM articles WHERE id = ?", (article_id,)).fetchone()
+        event = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone() if event_id else None
+        if event is None:
+            return _new_event(conn, article, _now())
+
+        places = json.loads(event["governorates"] or "[]")
+        places += [p for p in json.loads(article["governorates"] or "[]") if p not in places]
+        severity = max(event["severity"], article["severity"], key=lambda s: SEVERITY_RANK.get(s, 0))
+        conn.execute(
+            """UPDATE events SET governorates = ?, cases = ?, deaths = ?, severity = ?,
+                   trend = ?, summary_fr = ?, last_seen = ?, article_count = article_count + 1
+               WHERE id = ?""",
+            (json.dumps(places, ensure_ascii=False), _bigger(event["cases"], article["cases"]),
+             _bigger(event["deaths"], article["deaths"]), severity,
+             article["trend"] if article["trend"] != "unknown" else event["trend"],
+             article["summary_fr"], _now(), event_id),
+        )
+        conn.execute("UPDATE articles SET event_id = ? WHERE id = ?", (event_id, article_id))
+        return event_id
+
+
+def get_events_to_alert(min_severity):
+    """Events at or above min_severity whose severity went up since their last alert (or never alerted)."""
+    with connect() as conn:
+        events = conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+    rank = SEVERITY_RANK.get
+    return [e for e in events
+            if rank(e["severity"], 0) >= rank(min_severity)
+            and rank(e["severity"], 0) > rank(e["alerted_severity"] or "none")]
+
+
+def get_event_articles(event_id):
+    """All articles about one event, oldest first."""
+    with connect() as conn:
+        return conn.execute("SELECT * FROM articles WHERE event_id = ? ORDER BY id", (event_id,)).fetchall()
+
+
+def mark_event_alerted(event_id, severity):
+    with connect() as conn:
+        conn.execute("UPDATE events SET alerted_severity = ? WHERE id = ?", (severity, event_id))
+        conn.execute("UPDATE articles SET alerted = 1 WHERE event_id = ?", (event_id,))
 
 
 if __name__ == "__main__":

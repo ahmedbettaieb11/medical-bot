@@ -41,28 +41,31 @@ SEVERITY_LABELS = {"high": "🔴 HIGH", "medium": "🟠 MEDIUM", "low": "🟡 LO
 TREND_LABELS = {"rising": "📈 rising", "stable": "➡️ stable", "falling": "📉 falling"}
 
 
-def format_article(article):
-    """Build the alert text for one article from the database (after the AI has read it)."""
+def format_event(event, articles):
+    """Build the alert text for one event, from the event and all the articles reporting it."""
     e = html.escape  # makes titles with < > & safe for Telegram's HTML mode
-    where = ", ".join(json.loads(article["governorates"] or "[]")) or article["country"] or "?"
+    where = ", ".join(json.loads(event["governorates"] or "[]")) or event["country"] or "?"
+    header = "🔄 <b>UPDATE</b> · " if event["alerted_severity"] else ""
     lines = [
-        f"🩺 <b>{e((article['disease'] or 'Health event').capitalize())}</b> — {e(where)}",
-        f"Severity: {SEVERITY_LABELS.get(article['severity'], article['severity'])}",
+        f"{header}🩺 <b>{e((event['disease'] or 'Health event').capitalize())}</b> — {e(where)}",
+        f"Severity: {SEVERITY_LABELS.get(event['severity'], event['severity'])}",
     ]
     numbers = []
-    if article["cases"] is not None:
-        numbers.append(f"{article['cases']} cases")
-    if article["deaths"] is not None:
-        numbers.append(f"{article['deaths']} deaths")
-    if article["trend"] in TREND_LABELS:
-        numbers.append(TREND_LABELS[article["trend"]])
+    if event["cases"] is not None:
+        numbers.append(f"{event['cases']} cases")
+    if event["deaths"] is not None:
+        numbers.append(f"{event['deaths']} deaths")
+    if event["trend"] in TREND_LABELS:
+        numbers.append(TREND_LABELS[event["trend"]])
     if numbers:
         lines.append(" · ".join(numbers))
+    lines += ["", e(event["summary_fr"] or ""), ""]
+    if len(articles) > 1:
+        sources = sorted({a["source"] for a in articles})
+        lines.append(f"📰 Reported by {len(articles)} articles ({e(', '.join(sources))}). Latest:")
+    latest = articles[-1]
     lines += [
-        "",
-        e(article["summary_fr"] or ""),
-        "",
-        f"📰 {e(article['source'])}: <i>{e(article['title'])}</i>",
-        f'<a href="{e(article["url"])}">Read the article</a>',
+        f"📰 {e(latest['source'])}: <i>{e(latest['title'])}</i>",
+        f'<a href="{e(latest["url"])}">Read the article</a>',
     ]
     return "\n".join(lines)

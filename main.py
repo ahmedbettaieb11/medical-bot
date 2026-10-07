@@ -1,7 +1,8 @@
-"""The bot's main run: collect → save new health articles → AI reads them → alert on Telegram.
+"""The bot's main run: collect → save new health articles → AI reads them and groups them
+into events → alert on Telegram.
 
 Run it with:  python main.py
-Each run only alerts about articles it hasn't seen before.
+Each event is alerted once; again only if it becomes more severe.
 """
 
 import time
@@ -13,7 +14,7 @@ import telegram_alert
 
 MAX_ANALYSES_PER_RUN = 30  # keeps us well inside Gemini's free tier; leftovers wait for the next run
 MAX_ALERTS_PER_RUN = 15    # leftovers are sent on the next run, so Telegram is never flooded
-ALERT_SEVERITIES = ("medium", "high")  # "low" (minor or far-away events) only goes to the dashboard
+ALERT_MIN_SEVERITY = "medium"  # "low" (minor or far-away events) only goes to the dashboard
 
 
 def main():
@@ -33,26 +34,32 @@ def main():
     to_analyze = database.get_unanalyzed()
     analyzed = 0
     for article in to_analyze[:MAX_ANALYSES_PER_RUN]:
-        result = analyze.analyze_article(article)
+        result = analyze.analyze_article(article, database.get_recent_events())
         if result is None:
             print("⏸️  Stopping AI analysis for this run; the rest will be analysed next run.")
             break
         database.save_analysis(article["id"], result)
         analyzed += 1
-        verdict = f"✅ {result['severity']}" if result["relevant"] else "⛔ not relevant"
+        verdict = "⛔ not relevant"
+        if result["relevant"]:
+            event_id = database.link_to_event(article["id"], result["same_event_as"])
+            joined = f"joins event #{event_id}" if result["same_event_as"] else f"new event #{event_id}"
+            verdict = f"✅ {result['severity']}, {joined}"
         print(f"   {verdict}: {article['title'][:80]}")
         time.sleep(2)  # stay well under the free tier's per-minute limit
     print(f"🤖 {analyzed} articles analysed")
     if len(to_analyze) > analyzed:
         print(f"   ({len(to_analyze) - analyzed} more waiting for the next run)")
 
-    pending = database.get_unalerted(ALERT_SEVERITIES)
+    # One alert per event (not per article); a new alert only if the event got more severe.
+    pending = database.get_events_to_alert(ALERT_MIN_SEVERITY)
     sent = 0
-    for article in pending[:MAX_ALERTS_PER_RUN]:
-        if not telegram_alert.send_message(telegram_alert.format_article(article)):
-            print("⏸️  Stopping alerts for this run; unsent articles will be retried next run.")
+    for event in pending[:MAX_ALERTS_PER_RUN]:
+        articles = database.get_event_articles(event["id"])
+        if not telegram_alert.send_message(telegram_alert.format_event(event, articles)):
+            print("⏸️  Stopping alerts for this run; unsent events will be retried next run.")
             break
-        database.mark_alerted(article["id"])
+        database.mark_event_alerted(event["id"], event["severity"])
         sent += 1
         time.sleep(1)  # Telegram allows about one message per second
     print(f"📨 {sent} alerts sent to Telegram")

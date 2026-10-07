@@ -37,7 +37,11 @@ single individual cases of a non-contagious or non-spreading condition.
 Only report what the article says. Do not guess numbers: use null when the article gives none.
 Write every text field in correct French: translate Arabic terms (e.g. تسمم غذائي = "intoxication
 alimentaire"), never transliterate them and never mix Arabic words into the French text.
-Always keep the French accents (é, è, à, ç): write "choléra", "été enregistrés"."""
+Always keep the French accents (é, è, à, ç): write "choléra", "été enregistrés".
+
+You may also get a list of events already being tracked. If the article reports one of them
+(same disease, same place, same outbreak, even with new numbers or from another outlet), put its
+number in "same_event_as". Otherwise (a new event, or the same disease somewhere else) use null."""
 
 # The exact shape of the answer we want back (Gemini is forced to follow it).
 ANSWER_SHAPE = {
@@ -61,9 +65,11 @@ ANSWER_SHAPE = {
                                     "chronic disease figures (cancer, diabetes...); none = not relevant."},
         "trend": {"type": "string", "enum": ["rising", "stable", "falling", "unknown"]},
         "summary_fr": {"type": "string", "description": "One-sentence summary in French."},
+        "same_event_as": {"type": "integer", "nullable": True,
+                          "description": "Number of the tracked event this article reports, or null."},
     },
     "required": ["relevant", "reason", "disease", "governorates", "country", "cases", "deaths",
-                 "severity", "trend", "summary_fr"],
+                 "severity", "trend", "summary_fr", "same_event_as"],
 }
 
 
@@ -95,10 +101,20 @@ def ask_gemini(model, prompt):
     return answer
 
 
-def analyze_article(article):
+def describe_events(events):
+    """Short list of tracked events for the prompt, e.g. '#3: grippe — Sfax, Tunisie (12 cas). ...'"""
+    lines = []
+    for e in events:
+        where = ", ".join(json.loads(e["governorates"] or "[]") + [e["country"] or ""]).strip(", ")
+        lines.append(f"#{e['id']}: {e['disease']} — {where} — {e['summary_fr']}")
+    return "\n".join(lines)
+
+
+def analyze_article(article, recent_events=()):
     """Return Gemini's analysis of one article (a dict), or None if Gemini couldn't be reached.
 
     `article` needs: title, summary, source.
+    `recent_events`: events already tracked (database rows); Gemini says if the article is one of them.
     """
     if not API_KEY:
         print("❌ GEMINI_API_KEY missing in .env")
@@ -106,6 +122,8 @@ def analyze_article(article):
     prompt = (f"Source: {article['source']}\n"
               f"Title: {article['title']}\n"
               f"Summary: {article['summary'] or '(none)'}")
+    if recent_events:
+        prompt += "\n\nEvents already being tracked:\n" + describe_events(recent_events)
 
     # Busy or rate-limited models are common on the free tier, so we wait and retry.
     for attempt, wait in enumerate([5, 20, None], start=1):
@@ -113,6 +131,9 @@ def analyze_article(article):
             try:
                 result = ask_gemini(model, prompt)
                 result["model"] = model
+                # Ignore an event number Gemini made up (not in the list we gave it).
+                if result.get("same_event_as") not in {e["id"] for e in recent_events}:
+                    result["same_event_as"] = None
                 return result
             except requests.HTTPError as error:
                 status = error.response.status_code
